@@ -7,26 +7,56 @@ from datetime import datetime
 
 from groq import Groq
 
+# Load environment variables from .env file if it exists
+def load_env():
+    """Load environment variables from .env file"""
+    try:
+        with open('.env', 'r') as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
+
+# Load .env file
+load_env()
+
 # Initialize Groq client
-try:
-    # It's safer to load API keys from environment variables
-    # as it prevents them from being committed to version control.
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if not groq_api_key:
-        # Fallback to file if environment variable is not set
+def get_groq_api_key():
+    """Get Groq API key from various sources"""
+    api_key = os.getenv("GROQ_API_KEY")
+    if api_key:
+        return api_key
+    
+    try:
         with open("groq_api_key.txt", "r") as f:
-            groq_api_key = f.read().strip()
-except FileNotFoundError:
+            content = f.read().strip()
+            if '=' in content:
+                api_key = content.split('=', 1)[1].strip()
+            else:
+                api_key = content
+            return api_key
+    except FileNotFoundError:
+        pass
+    
     raise ValueError(
-        "GROQ_API_KEY environment variable not set and groq_api_key.txt not found."
+        "GROQ_API_KEY not found. Please either:\n"
+        "1. Set GROQ_API_KEY environment variable, or\n"
+        "2. Put just the API key (without GROQ_API_KEY=) in groq_api_key.txt, or\n"
+        "3. Add GROQ_API_KEY=your_key_here to .env file"
     )
+
+try:
+    groq_api_key = get_groq_api_key()
+    print(f"✅ API Key loaded successfully (ends with: ...{groq_api_key[-8:]})")
 except Exception as e:
-    raise ValueError(f"Error loading Groq API key: {e}")
+    print(f"❌ Error loading API key: {e}")
+    exit(1)
 
 client = Groq(api_key=groq_api_key)
 
-
-def generate_response(prompt, temperature, model="llama-3.1-8b-instant"):
+def generate_response(prompt, temperature, model="llama3-70b-8192"):
     """Generate a single response at a given temperature."""
     try:
         completion = client.chat.completions.create(
@@ -49,8 +79,7 @@ def generate_response(prompt, temperature, model="llama-3.1-8b-instant"):
             "status": "error",
         }
 
-
-def generate_responses_parallel(prompt, temperatures, model="llama-3.1-8b-instant"):
+def generate_responses_parallel(prompt, temperatures, model="llama3-70b-8192"):
     """Generate responses in parallel for faster execution."""
     responses = []
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -62,11 +91,14 @@ def generate_responses_parallel(prompt, temperatures, model="llama-3.1-8b-instan
         for future in as_completed(future_to_temp):
             result = future.result()
             responses.append(result)
+            if result["status"] == "success":
+                print(f"✅ Temperature {result['temperature']}: Success")
+            else:
+                print(f"❌ Temperature {result['temperature']}: {result['response']}")
 
     return sorted(responses, key=lambda x: x["temperature"])
 
-
-def score_response(prompt, response_text, temperature, model="llama-3.1-8b-instant"):
+def score_response(prompt, response_text, temperature, model="llama3-70b-8192"):
     """Score a single response out of 100."""
     score_prompt = f"""
     Rate this response to the prompt on a scale of 0-100 considering:
@@ -86,7 +118,7 @@ def score_response(prompt, response_text, temperature, model="llama-3.1-8b-insta
         completion = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": score_prompt}],
-            temperature=0,  # Use 0 temperature for consistent scoring
+            temperature=0,
             max_tokens=10,
             top_p=1,
             stream=False,
@@ -97,30 +129,24 @@ def score_response(prompt, response_text, temperature, model="llama-3.1-8b-insta
         if match:
             score = int(match.group(1))
             return min(100, max(0, score))
-        # If no clear score is parsed, return 0 as it indicates an issue
         return 0
     except Exception as e:
-        # Return 0 if there's an error during scoring
         print(f"Error scoring response: {e}")
         return 0
 
-
-def rank_responses(prompt, responses, model="llama-3.1-8b-instant"):
+def rank_responses(prompt, responses, model="llama3-70b-8192"):
     """Score and rank all responses."""
-    # Separate successful and error responses
     successful_responses = [r for r in responses if r["status"] == "success"]
     error_responses = [r for r in responses if r["status"] == "error"]
 
     if not successful_responses:
-        # If no successful responses, all responses are errors or empty
         for response in error_responses:
             response["score"] = 0
-            response["rank"] = 0  # Indicate unranked
+            response["rank"] = 0
         return responses
 
-    print("Scoring responses...")
+    print("📊 Scoring responses...")
 
-    # Score successful responses
     with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_response = {
             executor.submit(
@@ -131,13 +157,13 @@ def rank_responses(prompt, responses, model="llama-3.1-8b-instant"):
 
         for future in as_completed(future_to_response):
             original_response = future_to_response[future]
-            original_response["score"] = future.result()
+            score = future.result()
+            original_response["score"] = score
+            print(f"📈 Temperature {original_response['temperature']}: Score {score}/100")
 
-    # Assign score 0 to error responses
     for response in error_responses:
         response["score"] = 0
 
-    # Combine and rank all responses (successful and error)
     all_responses = successful_responses + error_responses
     ranked_responses = sorted(all_responses, key=lambda x: x["score"], reverse=True)
 
@@ -146,19 +172,14 @@ def rank_responses(prompt, responses, model="llama-3.1-8b-instant"):
 
     return ranked_responses
 
-
-def generate_html_report(prompts_data, overall_stats):
-    """Generate an HTML report using an f-string for clarity."""
-
-    # Using a multi-line f-string for the HTML template makes it more readable
-    # than string.replace(). For very complex templates, a templating engine
-    # like Jinja2 would be more suitable.
+def generate_html_report(prompts_data, overall_stats, model):
+    """Generate an HTML report with model name included."""
     html_content = f"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang=\"en\">
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta charset=\"UTF-8\">
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
         <title>AutoTemp Multi-Prompt Analysis</title>
         <style>
             * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -166,6 +187,7 @@ def generate_html_report(prompts_data, overall_stats):
             .container {{ max-width: 1000px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }}
             .header {{ background: #4CAF50; color: white; padding: 20px; text-align: center; }}
             .header h1 {{ font-size: 1.8rem; margin-bottom: 5px; }}
+            .header p {{ font-size: 1rem; }}
             .overall-stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; padding: 20px; background: #e8f5e9; border-bottom: 1px solid #dcdcdc; }}
             .stat-card {{ background: white; padding: 15px; border-radius: 5px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }}
             .stat-number {{ font-size: 1.5rem; font-weight: bold; color: #4CAF50; }}
@@ -192,16 +214,35 @@ def generate_html_report(prompts_data, overall_stats):
             .temp-score {{ display: flex; gap: 8px; align-items: center; font-size: 0.8rem; }}
             .temperature {{ background: #e0e0e0; padding: 2px 6px; border-radius: 4px; font-weight: 500; color: #444; }}
             .score {{ font-weight: bold; color: #4CAF50; }}
-            .response-content {{ padding: 15px; line-height: 1.5; color: #333; font-size: 0.9rem; max-height: 200px; overflow-y: auto; }}
+            .response-content {{ padding: 15px; line-height: 1.5; color: #333; font-size: 0.9rem; }}
+            .response-preview {{ display: block; }}
+            .response-full {{ display: none; }}
+            .show-more-btn {{ background: none; border: none; color: #1976d2; cursor: pointer; font-size: 0.9rem; margin-top: 8px; text-decoration: underline; }}
             .error-response {{ background: #ffebee; color: #c62828; border-color: #ef9a9a; }}
             .timestamp {{ text-align: center; color: #777; font-size: 0.8rem; padding: 15px; background: #f0f0f0; }}
         </style>
+        <script>
+        function toggleResponse(id) {{
+            var preview = document.getElementById('preview-' + id);
+            var full = document.getElementById('full-' + id);
+            var btn = document.getElementById('btn-' + id);
+            if (full.style.display === 'none') {{
+                full.style.display = 'block';
+                preview.style.display = 'none';
+                btn.textContent = 'Show less';
+            }} else {{
+                full.style.display = 'none';
+                preview.style.display = 'block';
+                btn.textContent = 'Show more';
+            }}
+        }}
+        </script>
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <h1>AutoTemp Multi-Prompt Analysis</h1>
-                <p>AI Response Ranking Across Multiple Prompts & Temperatures</p>
+                <p>AI Response Ranking Across Multiple Prompts & Temperatures (Model: {model})</p>
             </div>
 
             <div class="overall-stats">
@@ -230,14 +271,13 @@ def generate_html_report(prompts_data, overall_stats):
             {"".join([_generate_prompt_section(i, pd) for i, pd in enumerate(prompts_data)])}
 
             <div class="timestamp">
-                Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | Temperatures tested: {overall_stats["temperature_range"]}
+                Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | Model: {model} | Temperatures tested: {overall_stats["temperature_range"]}
             </div>
         </div>
     </body>
     </html>
     """
     return html_content
-
 
 def _generate_prompt_section(index, prompt_data):
     """Helper function to generate HTML for a single prompt section."""
@@ -289,12 +329,10 @@ def _generate_prompt_section(index, prompt_data):
     </div>
     """
 
-
 def _generate_response_card(response):
-    """Helper function to generate HTML for a single response card."""
+    """Helper function to generate HTML for a single response card with show more/less dropdown."""
     rank_class = f"rank-{response['rank']}" if response["rank"] <= 3 else ""
     error_class = "error-response" if response["status"] == "error" else ""
-
     emoji = (
         "🏆"
         if response["rank"] == 1
@@ -304,27 +342,31 @@ def _generate_response_card(response):
         if response["rank"] == 3
         else ""
     )
-
+    # Unique ID for toggling
+    unique_id = f"{response['temperature']}-{response['rank']}"
+    full_text = response['response'].replace('\n', '<br>')
+    preview_text = full_text[:200] + ("..." if len(full_text) > 200 else "")
     return f"""
-    <div class="response-card {rank_class} {error_class}">
-        <div class="response-header">
-            <div class="rank-badge">
+    <div class=\"response-card {rank_class} {error_class}\">
+        <div class=\"response-header\">
+            <div class=\"rank-badge\">
                 #{response['rank']} {emoji}
             </div>
-            <div class="temp-score">
-                <div class="temperature">T: {response['temperature']}</div>
-                <div class="score">{response['score']}/100</div>
+            <div class=\"temp-score\">
+                <div class=\"temperature\">T: {response['temperature']}</div>
+                <div class=\"score\">{response['score']}/100</div>
             </div>
         </div>
-        <div class="response-content">
-            {response['response'].replace('\n', '<br>')}
+        <div class=\"response-content\">
+            <span class=\"response-preview\" id=\"preview-{unique_id}\">{preview_text}</span>
+            <span class=\"response-full\" id=\"full-{unique_id}\">{full_text}</span>
+            <button class=\"show-more-btn\" id=\"btn-{unique_id}\" onclick=\"toggleResponse('{unique_id}')\">Show more</button>
         </div>
     </div>
     """
 
-
 def autotemp_multi_prompt(
-    prompts, temperatures, model="llama-3.1-8b-instant", open_browser=True
+    prompts, temperatures, model="llama3-70b-8192", open_browser=True
 ):
     """
     Generate responses for multiple prompts and create a comprehensive HTML report.
@@ -342,6 +384,7 @@ def autotemp_multi_prompt(
     """
     print(f"Testing {len(prompts)} prompts with {len(temperatures)} temperatures each...")
     print(f"Temperatures: {temperatures}")
+    print(f"Model: {model}")
 
     all_prompts_data = []
     total_responses_generated = 0
@@ -350,7 +393,7 @@ def autotemp_multi_prompt(
 
     for i, prompt in enumerate(prompts):
         print(f"\n--- Processing Prompt {i+1}/{len(prompts)} ---")
-        print(f"Prompt: {prompt[:70]}...")  # Truncate for display
+        print(f"Prompt: {prompt[:70]}...")
 
         responses = generate_responses_parallel(prompt, temperatures, model=model)
         ranked_responses = rank_responses(prompt, responses, model=model)
@@ -380,29 +423,25 @@ def autotemp_multi_prompt(
         "temperature_range": f"{min(temperatures)}-{max(temperatures)}",
     }
 
-    print("\nGenerating HTML report...")
-    html_content = generate_html_report(all_prompts_data, overall_stats)
+    print("\n📊 Generating HTML report...")
+    html_content = generate_html_report(all_prompts_data, overall_stats, model)
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
         f.write(html_content)
         html_file = f.name
 
-    print(f"HTML report saved to: {html_file}")
+    print(f"✅ HTML report saved to: {html_file}")
     if open_browser:
         webbrowser.open(f"file://{html_file}")
 
     return all_prompts_data, html_file
 
-
 if __name__ == "__main__":
     prompts = [
-        "Write a creative short story about a robot learning to cook.",
-        # "Explain quantum computing to a 5-year-old.",
+        "Write a creative short story in 1 paragraph about a robot learning to cook.",
         "layout detailed business plan for surviving a coffee shop during ww3.",
-        # "Write a poem about the ocean in the style of Shakespeare.",
-        # "Describe the future of artificial intelligence in 2030.",
     ]
-    temperatures = [0.1,0.5, 0.7, 0.9]
+    temperatures = [0.1, 0.3, 0.5, 0.7, 0.9]
 
     print("\n🚀 Starting analysis...")
     print(f"📝 Prompts: {len(prompts)}")
@@ -417,7 +456,6 @@ if __name__ == "__main__":
 
     print("\n📈 Quick Summary:")
     for i, result in enumerate(results):
-        # Ensure there are responses before trying to access the first one
         if result["responses"]:
             best = result["responses"][0]
             print(
